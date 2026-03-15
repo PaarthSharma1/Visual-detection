@@ -1,0 +1,266 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from datetime import datetime
+import time
+
+# ============================================
+# FIRE DETECTION SYSTEM
+# Electrothon Project
+# Video Player Style UI
+# ============================================
+
+model = YOLO("fire_model.pt")
+
+# ---- Configuration ----
+SOURCE = "fire_video2.mp4"
+CONFIDENCE_THRESHOLD = 0.15
+COLOR_AREA_THRESHOLD = 1000
+FIRE_PERSISTENCE = 8
+
+cap = cv2.VideoCapture(SOURCE)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+# Video properties
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+video_fps = cap.get(cv2.CAP_PROP_FPS)
+total_duration = total_frames / video_fps
+
+prev_time = 0
+fire_frame_count = 0
+alert_blink = 0
+paused = False
+current_frame = 0
+
+def format_time(seconds):
+    """Convert seconds to MM:SS format"""
+    m = int(seconds // 60)
+    s = int(seconds % 60)
+    return f"{m:02d}:{s:02d}"
+
+def draw_transparent_rect(frame, x1, y1, x2, y2, color, alpha=0.6):
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+def draw_corner_box(frame, x1, y1, x2, y2, color, thickness=2, corner_len=20):
+    cv2.line(frame, (x1, y1), (x1 + corner_len, y1), color, thickness)
+    cv2.line(frame, (x1, y1), (x1, y1 + corner_len), color, thickness)
+    cv2.line(frame, (x2, y1), (x2 - corner_len, y1), color, thickness)
+    cv2.line(frame, (x2, y1), (x2, y1 + corner_len), color, thickness)
+    cv2.line(frame, (x1, y2), (x1 + corner_len, y2), color, thickness)
+    cv2.line(frame, (x1, y2), (x1, y2 - corner_len), color, thickness)
+    cv2.line(frame, (x2, y2), (x2 - corner_len, y2), color, thickness)
+    cv2.line(frame, (x2, y2), (x2, y2 - corner_len), color, thickness)
+
+while True:
+    if not paused:
+        ret, frame = cap.read()
+        if not ret:
+            # Loop video
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            current_frame = 0
+            continue
+        current_frame += 1
+
+    alert_blink = (alert_blink + 1) % 20
+
+    frame = cv2.resize(frame, (1280, 720))
+    H, W = frame.shape[:2]
+
+    # ---- FPS Counter ----
+    curr_time = time.time()
+    fps = 1 / (curr_time - prev_time) if not paused else 0
+    prev_time = curr_time
+
+    # ============================================
+    # METHOD 1: YOLOv8 Detection
+    # ============================================
+    results = model(frame, verbose=False)
+    yolo_detected = False
+    max_confidence = 0
+
+    for r in results:
+        for box in r.boxes:
+            confidence = box.conf[0]
+            label = model.names[int(box.cls[0])]
+
+            if confidence > CONFIDENCE_THRESHOLD:
+                yolo_detected = True
+                max_confidence = max(max_confidence, float(confidence))
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), -1)
+                cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+                draw_corner_box(frame, x1, y1, x2, y2, (0, 0, 255), 2)
+
+                label_text = f"{label.upper()} {confidence:.0%}"
+                text_w = len(label_text) * 11
+                cv2.rectangle(frame, (x1, y1 - 28), (x1 + text_w, y1), (0, 0, 200), -1)
+                cv2.putText(frame, label_text, (x1 + 4, y1 - 8),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.55, (255, 255, 255), 1)
+
+    # ============================================
+    # METHOD 2: Color Detection
+    # ============================================
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower1 = np.array([0, 100, 200])
+    upper1 = np.array([35, 255, 255])
+    lower2 = np.array([20, 30, 200])
+    upper2 = np.array([65, 255, 255])
+    mask1 = cv2.inRange(hsv, lower1, upper1)
+    mask2 = cv2.inRange(hsv, lower2, upper2)
+    mask = cv2.bitwise_or(mask1, mask2)
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    color_detected = False
+    for c in contours:
+        if cv2.contourArea(c) > COLOR_AREA_THRESHOLD:
+            color_detected = True
+            x, y, w, h = cv2.boundingRect(c)
+            draw_corner_box(frame, x, y, x+w, y+h, (0, 165, 255), 2)
+
+    # ============================================
+    # COMBINED DECISION
+    # ============================================
+    fire_detected = yolo_detected or color_detected
+
+    if fire_detected:
+        fire_frame_count = FIRE_PERSISTENCE
+    elif fire_frame_count > 0:
+        fire_frame_count -= 1
+
+    show_fire = fire_frame_count > 0
+
+    # ============================================
+    # VIDEO PLAYER UI
+    # ============================================
+
+    # ---- Top Bar ----
+    draw_transparent_rect(frame, 0, 0, W, 50, (0, 0, 0), 0.75)
+    cv2.line(frame, (0, 50), (W, 50), (50, 50, 50), 1)
+
+    # Left status indicator
+    status_color = (0, 0, 255) if show_fire else (0, 180, 80)
+    cv2.rectangle(frame, (0, 0), (4, 50), status_color, -1)
+
+    # Title
+    cv2.putText(frame, "FIRE DETECTION SYSTEM", (12, 18),
+        cv2.FONT_HERSHEY_DUPLEX, 0.5, (160, 160, 160), 1)
+
+    # Status
+    if show_fire:
+        s_color = (0, 0, 255) if alert_blink < 10 else (0, 60, 180)
+        cv2.putText(frame, "⚠  FIRE DETECTED", (12, 42),
+            cv2.FONT_HERSHEY_DUPLEX, 0.7, s_color, 2)
+    else:
+        cv2.putText(frame, "●  SAFE", (12, 42),
+            cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 180, 80), 2)
+
+    # FPS top right
+    cv2.putText(frame, f"FPS {fps:.0f}", (W - 100, 20),
+        cv2.FONT_HERSHEY_DUPLEX, 0.45, (100, 100, 100), 1)
+
+    # Method top right
+    method = ""
+    if yolo_detected and color_detected:
+        method = "YOLO + COLOR"
+    elif yolo_detected:
+        method = "YOLO"
+    elif color_detected:
+        method = "COLOR"
+    if method:
+        cv2.putText(frame, method, (W - 180, 42),
+            cv2.FONT_HERSHEY_DUPLEX, 0.45, (80, 180, 255), 1)
+
+    # ---- Bottom Player Bar ----
+    player_bar_h = 80
+    draw_transparent_rect(frame, 0, H - player_bar_h, W, H, (0, 0, 0), 0.80)
+    cv2.line(frame, (0, H - player_bar_h), (W, H - player_bar_h), (50, 50, 50), 1)
+
+    # ---- Progress Bar ----
+    pb_x = 15
+    pb_y = H - player_bar_h + 12
+    pb_w = W - 30
+    pb_h = 4
+    progress = current_frame / total_frames if total_frames > 0 else 0
+
+    # Track background
+    cv2.rectangle(frame, (pb_x, pb_y), (pb_x + pb_w, pb_y + pb_h), (60, 60, 60), -1)
+
+    # Fire segments — highlight detected frames in red on progress bar
+    if show_fire:
+        seg_x = pb_x + int(progress * pb_w) - 3
+        cv2.rectangle(frame, (max(pb_x, seg_x - 10), pb_y - 1),
+            (min(pb_x + pb_w, seg_x + 10), pb_y + pb_h + 1), (0, 0, 255), -1)
+
+    # Progress fill
+    fill_color = (0, 0, 220) if show_fire else (0, 150, 255)
+    cv2.rectangle(frame, (pb_x, pb_y),
+        (pb_x + int(progress * pb_w), pb_y + pb_h), fill_color, -1)
+
+    # Playhead dot
+    dot_x = pb_x + int(progress * pb_w)
+    cv2.circle(frame, (dot_x, pb_y + pb_h // 2), 7, (255, 255, 255), -1)
+    cv2.circle(frame, (dot_x, pb_y + pb_h // 2), 5,
+        (0, 0, 255) if show_fire else (0, 150, 255), -1)
+
+    # ---- Time ----
+    current_time = current_frame / video_fps if video_fps > 0 else 0
+    time_text = f"{format_time(current_time)}  /  {format_time(total_duration)}"
+    cv2.putText(frame, time_text, (pb_x, H - player_bar_h + 42),
+        cv2.FONT_HERSHEY_DUPLEX, 0.5, (180, 180, 180), 1)
+
+    # ---- Play/Pause indicator ----
+    play_icon = "⏸ PAUSE" if paused else "▶ PLAY"
+    cv2.putText(frame, play_icon, (pb_x, H - player_bar_h + 65),
+        cv2.FONT_HERSHEY_DUPLEX, 0.45, (120, 120, 120), 1)
+
+    # ---- Confidence bar ----
+    if show_fire and max_confidence > 0:
+        conf_x = W - 320
+        conf_y = H - player_bar_h + 30
+        conf_w = 300
+        conf_h = 10
+        cv2.rectangle(frame, (conf_x, conf_y),
+            (conf_x + conf_w, conf_y + conf_h), (40, 40, 40), -1)
+        fill_w = int(max_confidence * conf_w)
+        cv2.rectangle(frame, (conf_x, conf_y),
+            (conf_x + fill_w, conf_y + conf_h),
+            (0, 0, 255) if max_confidence > 0.6 else (0, 120, 255), -1)
+        cv2.rectangle(frame, (conf_x, conf_y),
+            (conf_x + conf_w, conf_y + conf_h), (80, 80, 80), 1)
+        cv2.putText(frame, f"CONFIDENCE  {max_confidence:.0%}",
+            (conf_x, conf_y - 5), cv2.FONT_HERSHEY_DUPLEX, 0.42, (150, 150, 150), 1)
+
+    # ---- Timestamp ----
+    cv2.putText(frame, datetime.now().strftime("%Y-%m-%d  %H:%M:%S"),
+        (W - 320, H - player_bar_h + 65),
+        cv2.FONT_HERSHEY_DUPLEX, 0.42, (80, 80, 80), 1)
+
+    # ---- Alerts (uncomment when ready) ----
+    # if show_fire:
+    #     winsound.Beep(1000, 200)
+    #     with open("fire_log.txt", "a") as f:
+    #         f.write(f"FIRE DETECTED at {datetime.now()} - Confidence: {max_confidence:.0%}\n")
+
+    cv2.imshow("Fire Detection System", frame)
+
+    # ---- Controls ----
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord(' '):
+        # Space = pause/play
+        paused = not paused
+    elif key == ord('r'):
+        # R = restart video
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        current_frame = 0
+
+cap.release()
+cv2.destroyAllWindows()
